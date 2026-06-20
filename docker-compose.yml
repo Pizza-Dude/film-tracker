@@ -1,0 +1,25 @@
+services:
+  film-tracker:
+    build: .
+    container_name: film-tracker
+    ports:
+      - target: 4519
+        published: 4519
+        protocol: tcp
+        host_ip: 0.0.0.0
+    environment:
+      PORT: "4519"
+      OMDB_API_KEY: ${OMDB_API_KEY}
+      TMDB_API_TOKEN: ${TMDB_API_TOKEN}
+    volumes:
+      - film-data:/app/server
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4519/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  film-data:
