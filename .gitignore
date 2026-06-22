@@ -1,0 +1,6 @@
+node_modules/
+dist/
+server/data.json
+server/backups/
+.env
+.DS_Store

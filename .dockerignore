@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.git/
+.DS_Store
+*.md
+src/
+vite.config.js
+index.html
+package.json
+package-lock.json
