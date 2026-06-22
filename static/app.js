@@ -4,6 +4,7 @@ const state = {
   tab: 'search',
   query: '',
   listFilter: '',
+  watchedRatingFilter: 0,
   discoverSubTab: 'trending',
   discoverMovies: [],
   searchResults: [],
@@ -23,6 +24,7 @@ const state = {
   detailModal: null,
   shareInfo: null,
   sharedView: null,
+  serverBackups: [],
 };
 
 async function api(path, options = {}) {
@@ -58,6 +60,27 @@ function filterList(movies, query) {
   });
 }
 
+function filterWatchedList(movies, query, ratingFilter) {
+  let list = filterList(movies, query);
+  const stars = Number(ratingFilter);
+  if (stars >= 1 && stars <= 5) {
+    list = list.filter((m) => Number(m.rating) === stars);
+  }
+  return list;
+}
+
+function watchedRatingFilterHtml() {
+  const options = [
+    { value: 0, label: t('allRatings') },
+    ...[1, 2, 3, 4, 5].map((n) => ({ value: n, label: '★'.repeat(n) })),
+  ];
+  return `<div class="rating-filter" role="group" aria-label="${t('filterByRating')}">
+    ${options.map(({ value, label }) => `
+      <button type="button" class="rating-filter__btn ${state.watchedRatingFilter === value ? 'rating-filter__btn--active' : ''}"
+        data-rating-filter="${value}">${label}</button>`).join('')}
+  </div>`;
+}
+
 function groupByGenre(movies) {
   const groups = {};
   for (const movie of movies) {
@@ -75,29 +98,76 @@ function starsHtml(value, interactive, imdbID) {
     .join('');
 }
 
+function streamUrl() {
+  return (state.settings.streamUrl || state.settingsForm.streamUrl || '').trim();
+}
+
+function streamLabel() {
+  return state.settings.streamLabel || state.settingsForm.streamLabel || t('streamDefaultLabel');
+}
+
+function currentUser() {
+  return state.users.find((u) => u.id === state.currentUserId) || null;
+}
+
+function isReadOnlyUser() {
+  return Boolean(currentUser()?.readOnly);
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function downloadBackupFile(filename) {
+  const res = await fetch(`/api/backup/download/${encodeURIComponent(filename)}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Download fehlgeschlagen');
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function streamButtonHtml() {
+  const url = streamUrl();
+  if (!url) return '';
+  return `<div class="stream-bar"><a class="btn btn--stream" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(streamLabel())}</a></div>`;
+}
+
 function movieCard(movie, opts = {}) {
-  const { watchlistIds, watchedIds, showRating, rating, context = 'search' } = opts;
+  const { watchlistIds, watchedIds, showRating, rating, context = 'search', readOnly = false } = opts;
   const inWatchlist = watchlistIds.has(movie.imdbID);
   const inWatched = watchedIds.has(movie.imdbID);
   const genres = getGenres(movie);
 
   let actions = '';
-  if (context === 'search' || context === 'discover') {
-    if (!inWatched && !inWatchlist) {
-      actions = `<button class="btn btn--secondary" data-action="watchlist" data-imdb="${movie.imdbID}">${t('addRemember')}</button>
-        <button class="btn btn--primary" data-action="watched" data-imdb="${movie.imdbID}">${t('addWatched')}</button>`;
-    } else if (inWatchlist && !inWatched) {
-      actions = `<button class="btn btn--primary" data-action="watched" data-imdb="${movie.imdbID}">${t('addWatched')}</button>
+  if (!readOnly) {
+    if (context === 'search' || context === 'discover') {
+      if (!inWatched && !inWatchlist) {
+        actions = `<button class="btn btn--secondary" data-action="watchlist" data-imdb="${movie.imdbID}">${t('addRemember')}</button>
+          <button class="btn btn--primary" data-action="watched" data-imdb="${movie.imdbID}">${t('addWatched')}</button>`;
+      } else if (inWatchlist && !inWatched) {
+        actions = `<button class="btn btn--primary" data-action="watched" data-imdb="${movie.imdbID}">${t('addWatched')}</button>
+          <button class="btn btn--ghost" data-action="remove-watchlist" data-imdb="${movie.imdbID}">${t('remove')}</button>`;
+      } else if (inWatched) {
+        actions = `<span class="movie-card__status">${t('alreadyWatched')}</span>
+          <button class="btn btn--ghost" data-action="remove-watched" data-imdb="${movie.imdbID}">${t('remove')}</button>`;
+      }
+    } else if (context === 'watchlist' && inWatchlist && !inWatched) {
+      actions = `<button class="btn btn--primary" data-action="watched" data-imdb="${movie.imdbID}">${t('markWatched')}</button>
         <button class="btn btn--ghost" data-action="remove-watchlist" data-imdb="${movie.imdbID}">${t('remove')}</button>`;
-    } else if (inWatched) {
-      actions = `<span class="movie-card__status">${t('alreadyWatched')}</span>
-        <button class="btn btn--ghost" data-action="remove-watched" data-imdb="${movie.imdbID}">${t('remove')}</button>`;
+    } else if (context === 'watched' && inWatched) {
+      actions = `<button class="btn btn--ghost" data-action="remove-watched" data-imdb="${movie.imdbID}">${t('removeWatched')}</button>`;
     }
-  } else if (context === 'watchlist' && inWatchlist && !inWatched) {
-    actions = `<button class="btn btn--primary" data-action="watched" data-imdb="${movie.imdbID}">${t('markWatched')}</button>
-      <button class="btn btn--ghost" data-action="remove-watchlist" data-imdb="${movie.imdbID}">${t('remove')}</button>`;
-  } else if (context === 'watched' && inWatched) {
-    actions = `<button class="btn btn--ghost" data-action="remove-watched" data-imdb="${movie.imdbID}">${t('removeWatched')}</button>`;
   }
 
   const poster = movie.Poster
@@ -114,7 +184,7 @@ function movieCard(movie, opts = {}) {
       </p>
       ${genres[0] !== unknownGenre() ? `<p class="movie-card__genre">${esc(genres.join(', '))}</p>` : ''}
       ${movie.Plot ? `<p class="movie-card__plot">${esc(movie.Plot)}</p>` : ''}
-      ${showRating ? `<div class="stars">${starsHtml(rating || movie.rating || 0, true, movie.imdbID)}</div>` : ''}
+      ${showRating && !readOnly ? `<div class="stars">${starsHtml(rating || movie.rating || 0, true, movie.imdbID)}</div>` : ''}
       <div class="movie-card__actions">${actions}</div>
     </div>
   </article>`;
@@ -140,7 +210,7 @@ function detailModalHtml(d) {
   const crew = (d.crew || []).map((c) => `<li><strong>${esc(c.job)}:</strong> ${esc(c.name)}</li>`).join('');
   const actors = d.Actors ? d.Actors.split(',').map((a) => `<li>${esc(a.trim())}</li>`).join('') : cast;
 
-  return `<div class="modal-overlay" id="detail-overlay">
+  return `<div class="modal-overlay modal-overlay--detail" id="detail-overlay">
     <div class="modal modal--detail">
       <button class="modal__close" id="detail-close" aria-label="${t('close')}">×</button>
       <div class="detail">
@@ -171,7 +241,9 @@ function settingsHtml() {
   const sf = state.settingsForm;
   return `<div class="settings">
     <section class="settings__section">
-      <h2>${t('settingsApi')}</h2>
+      <h2>${t('settingsTitle')}</h2>
+      <p class="settings__hint"><button class="btn btn--ghost btn--sm" data-tab="help">${t('tabHelp')} →</button></p>
+      <h3 class="settings__subtitle">${t('settingsApi')}</h3>
       <p class="settings__hint">${t('settingsApiHint')}</p>
       <label class="settings__label">${t('omdbKey')}</label>
       <input class="search-form__input" id="set-omdb" type="password" placeholder="${sf.omdbApiKey === '***' ? '••••••••' : ''}" value="${sf.omdbApiKey === '***' ? '' : esc(sf.omdbApiKey || '')}" />
@@ -189,8 +261,8 @@ function settingsHtml() {
       <h2>${t('settingsUsers')}</h2>
       <p class="settings__hint">${t('settingsUsersHint')}</p>
       <ul class="settings__users">${state.users.map((u) => `
-        <li><span>${esc(u.name)}</span>
-          ${state.users.length > 1 ? `<button class="btn btn--ghost btn--sm" data-delete-user="${u.id}">${t('deleteUser')}</button>` : ''}
+        <li><span>${esc(u.name)}${u.readOnly ? ` <em class="settings__badge">${t('readOnlyProfile')}</em>` : ''}</span>
+          ${!u.readOnly && state.users.length > 1 ? `<button class="btn btn--ghost btn--sm" data-delete-user="${u.id}">${t('deleteUser')}</button>` : ''}
         </li>`).join('')}
       </ul>
       <div class="settings__add-user">
@@ -199,26 +271,50 @@ function settingsHtml() {
       </div>
     </section>
     <section class="settings__section">
+      <h2>${t('settingsStream')}</h2>
+      <p class="settings__hint">${t('settingsStreamHint')}</p>
+      <label class="settings__label">${t('streamUrl')}</label>
+      <input class="search-form__input" id="set-stream-url" value="${esc(sf.streamUrl || '')}" placeholder="https://jellyfin.example.com/web/index.html" />
+      <label class="settings__label">${t('streamLabel')}</label>
+      <input class="search-form__input" id="set-stream-label" value="${esc(sf.streamLabel || t('streamDefaultLabel'))}" placeholder="${t('streamDefaultLabel')}" />
+    </section>
+    <section class="settings__section">
       <h2>${t('settingsBackup')}</h2>
+      <p class="settings__hint">${t('backupHint')}</p>
       <p>${t('lastBackup')}: ${state.settings.lastBackupAt ? new Date(state.settings.lastBackupAt).toLocaleString(currentLang === 'en' ? 'en' : 'de') : t('never')}</p>
       <div class="settings__backup-actions">
         <button class="btn btn--secondary" id="backup-now">${t('backupNow')}</button>
         <label class="btn btn--ghost btn--file">${t('restore')}<input type="file" id="restore-file" accept=".json" hidden /></label>
       </div>
+      ${state.serverBackups.length ? `<h3 class="settings__subtitle">${t('serverBackups')}</h3>
+        <ul class="settings__backups">${state.serverBackups.map((b) => `
+          <li><span><code>${esc(b.filename)}</code> · ${formatBytes(b.size)}</span>
+            <button class="btn btn--ghost btn--sm" data-download-backup="${esc(b.filename)}">${t('downloadBackup')}</button>
+          </li>`).join('')}</ul>` : ''}
     </section>
   </div>`;
 }
 
+function goHome() {
+  state.tab = 'search';
+  state.error = '';
+  state.success = '';
+  state.listFilter = '';
+  state.watchedRatingFilter = 0;
+  render();
+}
+
 function headerHtml() {
   return `<header class="header">
-    <div class="header__brand">
+    <button type="button" class="header__brand" id="go-home" title="${t('appTitle')}">
       <span class="header__icon">🎬</span>
       <div><h1>${t('appTitle')}</h1><p class="header__subtitle">${t('appSubtitle')}</p></div>
-    </div>
+    </button>
     <div class="header__actions">
       ${state.users.length ? `<select class="header__user-select" id="user-select" title="${t('selectUser')}">
         ${state.users.map((u) => `<option value="${u.id}" ${u.id === state.currentUserId ? 'selected' : ''}>${esc(u.name)}</option>`).join('')}
       </select>` : ''}
+      <button class="btn btn--ghost btn--icon ${state.tab === 'help' ? 'btn--active' : ''}" data-tab="help" title="${t('tabHelp')}">?</button>
       <button class="btn btn--ghost btn--icon ${state.tab === 'settings' ? 'btn--active' : ''}" data-tab="settings" title="${t('tabSettings')}">⚙</button>
     </div>
   </header>`;
@@ -234,6 +330,16 @@ function findMovie(imdbID) {
 
 async function loadUserLists() {
   [state.watchlist, state.watched] = await Promise.all([api('/watchlist'), api('/watched')]);
+}
+
+async function loadServerBackups() {
+  try {
+    const data = await api('/backups');
+    state.serverBackups = data.backups || [];
+    if (data.lastBackupAt) state.settings.lastBackupAt = data.lastBackupAt;
+  } catch {
+    state.serverBackups = [];
+  }
 }
 
 async function switchUser(userId) {
@@ -275,7 +381,8 @@ function render() {
   const watchlistIds = new Set(state.watchlist.map((m) => m.imdbID));
   const watchedIds = new Set(state.watched.map((m) => m.imdbID));
   const ratings = Object.fromEntries(state.watched.map((m) => [m.imdbID, m.rating]));
-  const cardOpts = { watchlistIds, watchedIds, context: state.tab };
+  const readOnly = isReadOnlyUser();
+  const cardOpts = { watchlistIds, watchedIds, context: state.tab, readOnly };
   const tabs = ['search', 'discover', 'watchlist', 'watched'];
   const tabLabels = { search: t('tabSearch'), discover: t('tabDiscover'), watchlist: t('tabWatchlist'), watched: t('tabWatched') };
 
@@ -293,24 +400,31 @@ function render() {
   let mainContent = '';
   if (state.tab === 'settings') {
     mainContent = settingsHtml();
+  } else if (state.tab === 'help') {
+    mainContent = helpHtml();
   } else if (state.tab === 'search') {
-    mainContent = `<form class="search-form" id="search-form">
+    mainContent = `${streamButtonHtml()}<form class="search-form" id="search-form">
       <input class="search-form__input" type="search" placeholder="${t('searchPlaceholder')}" value="${esc(state.query)}" id="search-input" />
       <button type="submit" class="btn btn--primary" ${state.loading ? 'disabled' : ''}>${state.loading ? t('searching') : t('searchBtn')}</button>
     </form>${state.searchResults.length ? renderMovieGrid(state.searchResults, { ...cardOpts, context: 'search' }) : ''}`;
   } else if (state.tab === 'watchlist' || state.tab === 'watched') {
     const raw = state.tab === 'watchlist' ? state.watchlist : state.watched;
-    const filtered = filterList(raw, state.listFilter);
-    mainContent = `<div class="list-filter">
+    const filtered = state.tab === 'watched'
+      ? filterWatchedList(raw, state.listFilter, state.watchedRatingFilter)
+      : filterList(raw, state.listFilter);
+    const emptyFilteredMsg = state.tab === 'watched' && state.watchedRatingFilter >= 1
+      ? t('noRatingFilterResults', { n: state.watchedRatingFilter })
+      : t('noFilterResults', { q: state.listFilter });
+    mainContent = `${state.tab === 'watched' ? watchedRatingFilterHtml() : ''}<div class="list-filter">
       <input class="search-form__input" type="search" id="list-filter-input"
         placeholder="${state.tab === 'watchlist' ? t('filterWatchlist') : t('filterWatched')}" value="${esc(state.listFilter)}" />
     </div>${filtered.length > 0 ? `<div class="list-toolbar">
       <span>${t('filmsCount', { n: filtered.length, total: raw.length })}</span>
-      <button class="btn btn--secondary btn--sm" id="share-btn">${t('share')}</button>
+      ${readOnly ? '' : `<button class="btn btn--secondary btn--sm" id="share-btn">${t('share')}</button>`}
     </div>${renderGroupedLists(filtered, { ...cardOpts, showRating: state.tab === 'watched' })}`
-      : raw.length === 0 ? `<div class="empty-state"><p>${state.tab === 'watchlist' ? t('emptyWatchlist') : t('emptyWatched')}</p>
-        <button class="btn btn--secondary" data-tab="search">${t('searchMovies')}</button></div>`
-      : `<div class="empty-state"><p>${t('noFilterResults', { q: state.listFilter })}</p></div>`}`;
+      : raw.length === 0 ? `<div class="empty-state"><p>${readOnly ? t('defaultProfileReadOnly') : (state.tab === 'watchlist' ? t('emptyWatchlist') : t('emptyWatched'))}</p>
+        ${readOnly ? `<button class="btn btn--secondary" data-tab="settings">${t('openSettings')}</button>` : `<button class="btn btn--secondary" data-tab="search">${t('searchMovies')}</button>`}</div>`
+      : `<div class="empty-state"><p>${emptyFilteredMsg}</p></div>`}`;
   } else if (state.tab === 'discover') {
     mainContent = `<nav class="subtabs">
       <button class="subtabs__btn ${state.discoverSubTab === 'trending' ? 'subtabs__btn--active' : ''}" data-discover="trending">${t('trending')}</button>
@@ -323,6 +437,7 @@ function render() {
   app.innerHTML = `<div class="app">
     ${headerHtml()}
     ${!state.searchReady ? `<div class="alert alert--warning">${t('apiMissing')}</div>` : ''}
+    ${readOnly && state.tab !== 'settings' && state.tab !== 'help' ? `<div class="alert alert--warning">${t('defaultProfileReadOnly')}</div>` : ''}
     ${state.tab === 'discover' && !state.tmdbReady ? `<div class="alert alert--warning">${t('tmdbMissing')}</div>` : ''}
     ${state.error ? `<div class="alert alert--error">${esc(state.error)}<button class="alert__close" id="clear-error">×</button></div>` : ''}
     ${state.success ? `<div class="alert alert--success">${esc(state.success)}<button class="alert__close" id="clear-success">×</button></div>` : ''}
@@ -332,7 +447,7 @@ function render() {
         <button class="btn btn--secondary btn--sm" id="copy-share">${t('copyLink')}</button>
         <button class="btn btn--ghost btn--sm" id="close-share">${t('close')}</button>
       </div></div>` : ''}
-    ${state.tab !== 'settings' ? `<nav class="tabs">${tabs.map((id) => {
+    ${state.tab !== 'settings' && state.tab !== 'help' ? `<nav class="tabs">${tabs.map((id) => {
       const count = id === 'watchlist' ? state.watchlist.length : id === 'watched' ? state.watched.length : 0;
       return `<button class="tabs__btn ${state.tab === id ? 'tabs__btn--active' : ''}" data-tab="${id}">${tabLabels[id]}${count ? `<span class="tabs__badge">${count}</span>` : ''}</button>`;
     }).join('')}</nav>` : ''}
@@ -358,6 +473,8 @@ function bindEvents() {
     if (e.target.id === 'detail-overlay') { state.detailModal = null; render(); }
   });
 
+  document.getElementById('go-home')?.addEventListener('click', goHome);
+
   document.getElementById('user-select')?.addEventListener('change', (e) => switchUser(e.target.value));
 
   document.querySelectorAll('[data-tab]').forEach((btn) => {
@@ -365,10 +482,14 @@ function bindEvents() {
       state.tab = btn.dataset.tab;
       state.error = '';
       state.listFilter = '';
+      if (state.tab !== 'watched') state.watchedRatingFilter = 0;
       if (state.tab === 'settings') {
         const s = await api('/settings');
         state.settings = s;
         state.settingsForm = { ...s };
+        await loadServerBackups();
+        render();
+      } else if (state.tab === 'help') {
         render();
       } else {
         if (state.tab !== 'search') { state.searchResults = []; state.query = ''; }
@@ -380,6 +501,13 @@ function bindEvents() {
 
   document.querySelectorAll('[data-discover]').forEach((btn) => {
     btn.addEventListener('click', () => { state.discoverSubTab = btn.dataset.discover; loadDiscover(); });
+  });
+
+  document.querySelectorAll('[data-rating-filter]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.watchedRatingFilter = Number(btn.dataset.ratingFilter);
+      render();
+    });
   });
 
   document.getElementById('list-filter-input')?.addEventListener('input', (e) => {
@@ -423,7 +551,9 @@ function bindEvents() {
     const tmdb = document.getElementById('set-tmdb').value.trim();
     const lang = document.getElementById('set-lang').value;
     const autoBackup = document.getElementById('set-autobackup').checked;
-    const body = { language: lang, autoBackup };
+    const streamUrlVal = document.getElementById('set-stream-url')?.value.trim();
+    const streamLabelVal = document.getElementById('set-stream-label')?.value.trim();
+    const body = { language: lang, autoBackup, streamUrl: streamUrlVal, streamLabel: streamLabelVal };
     if (omdb) body.omdbApiKey = omdb;
     if (tmdb) body.tmdbApiToken = tmdb;
     try {
@@ -466,11 +596,23 @@ function bindEvents() {
 
   document.getElementById('backup-now')?.addEventListener('click', async () => {
     try {
-      await api('/backup');
+      const info = await api('/backup');
+      await downloadBackupFile(info.filename);
+      await loadServerBackups();
       state.settings = await api('/settings');
-      state.success = t('backupSuccess');
+      state.success = t('backupDownloadSuccess');
       render();
     } catch (e) { state.error = e.message; render(); }
+  });
+
+  document.querySelectorAll('[data-download-backup]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        await downloadBackupFile(btn.dataset.downloadBackup);
+        state.success = t('backupDownloaded');
+        render();
+      } catch (e) { state.error = e.message; render(); }
+    });
   });
 
   document.getElementById('restore-file')?.addEventListener('change', async (e) => {
@@ -531,7 +673,6 @@ function bindEvents() {
       state.watched = await api('/watched', { method: 'POST', body: JSON.stringify({ movie, rating }) });
       state.watchlist = state.watchlist.filter((m) => m.imdbID !== movie.imdbID);
       state.ratingModal = null;
-      state.tab = 'watched';
       render();
     } catch (err) { state.error = err.message; render(); }
   });

@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -26,6 +27,8 @@ DEFAULT_SETTINGS = {
     "tmdbApiToken": "",
     "autoBackup": True,
     "lastBackupAt": None,
+    "streamUrl": "",
+    "streamLabel": "Stream",
 }
 
 DEFAULT_DATA = {
@@ -78,14 +81,36 @@ def apply_api_keys(settings):
         TMDB_TOKEN = os.environ.get("TMDB_API_TOKEN", "")
 
 
+def normalize_settings(settings):
+    s = {**DEFAULT_SETTINGS, **(settings or {})}
+    if s.get("mediaLinkTemplate") and not s.get("streamUrl"):
+        s["streamUrl"] = s["mediaLinkTemplate"]
+    if s.get("mediaLinkLabel") and not s.get("streamLabel"):
+        s["streamLabel"] = s["mediaLinkLabel"]
+    for key in ("mediaPaths", "mediaLinkTemplate", "mediaLinkLabel"):
+        s.pop(key, None)
+    if not s.get("streamLabel"):
+        s["streamLabel"] = "Stream"
+    return s
+
+
 def migrate_db(raw):
     if "userData" in raw and "settings" in raw:
         data = {**DEFAULT_DATA, **raw}
-        data["settings"] = {**DEFAULT_SETTINGS, **data.get("settings", {})}
+        data["settings"] = normalize_settings(data.get("settings", {}))
+        for user in data.get("users", []):
+            if user.get("name") == "Standard":
+                user["name"] = "Default"
+            if user.get("name") == "Default":
+                user["readOnly"] = True
+                uid = user.get("id")
+                if uid and uid in data.get("userData", {}):
+                    data["userData"][uid]["watchlist"] = []
+                    data["userData"][uid]["watched"] = []
         return data
 
     user_id = str(uuid.uuid4())[:8]
-    settings = DEFAULT_SETTINGS.copy()
+    settings = normalize_settings(DEFAULT_SETTINGS.copy())
     if os.environ.get("OMDB_API_KEY"):
         settings["omdbApiKey"] = extract_api_key(os.environ["OMDB_API_KEY"])
     if os.environ.get("TMDB_API_TOKEN"):
@@ -93,7 +118,7 @@ def migrate_db(raw):
 
     return {
         "settings": settings,
-        "users": [{"id": user_id, "name": "Standard", "createdAt": now_iso()}],
+        "users": [{"id": user_id, "name": "Default", "createdAt": now_iso(), "readOnly": True}],
         "userData": {
             user_id: {
                 "watchlist": raw.get("watchlist", []),
@@ -153,10 +178,31 @@ def create_backup(data=None):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     data["settings"]["lastBackupAt"] = now_iso()
     DB_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    backups = sorted(BACKUP_DIR.glob("backup-*.json"), reverse=True)
-    for old in backups[10:]:
-        old.unlink(missing_ok=True)
     return {"filename": path.name, "createdAt": data["settings"]["lastBackupAt"]}
+
+
+def user_by_id(db, user_id):
+    for user in db.get("users", []):
+        if user["id"] == user_id:
+            return user
+    return None
+
+
+def user_is_read_only(db, user_id):
+    user = user_by_id(db, user_id)
+    return bool(user and user.get("readOnly"))
+
+
+def list_write_forbidden(handler, db, user_id):
+    if user_is_read_only(db, user_id):
+        lang = db.get("settings", {}).get("language", "de")
+        msg = (
+            "Lists cannot be edited in the Default profile."
+            if lang == "en"
+            else "Im Profil Default können keine Listen bearbeitet werden."
+        )
+        return json_response(handler, 403, {"error": msg})
+    return None
 
 
 def get_user_id(handler, db):
@@ -230,8 +276,7 @@ def parse_genres(movie):
 def omdb_fetch(params):
     if not OMDB_KEY:
         raise ValueError("OMDB nicht konfiguriert")
-    qs = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"https://www.omdbapi.com/?apikey={OMDB_KEY}&{qs}&"
+    url = f"https://www.omdbapi.com/?{urlencode({**params, 'apikey': OMDB_KEY})}"
     with urlopen(url) as resp:
         data = json.loads(resp.read())
     if data.get("Response") == "False":
@@ -249,9 +294,78 @@ def tmdb_fetch(path, params=None, lang="de-DE"):
         return json.loads(resp.read())
 
 
+def normalize_search_text(text):
+    if not text:
+        return ""
+    text = text.lower().replace("–", "-").replace("—", "-")
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def search_query_variants(q):
+    variants = [q.strip()]
+    norm = q.replace("–", "-").replace("—", "-")
+    for sep in (" - ", "-"):
+        if sep in norm:
+            head = norm.split(sep)[0].strip()
+            if head and head not in variants:
+                variants.append(head)
+    return variants
+
+
+def search_match_score(movie, q):
+    q_norm = normalize_search_text(q)
+    if not q_norm:
+        return 3
+    titles = [
+        normalize_search_text(movie.get("Title")),
+        normalize_search_text(movie.get("originalTitle")),
+    ]
+    best = 3
+    for title in titles:
+        if not title:
+            continue
+        if title == q_norm:
+            return 0
+        if title.startswith(q_norm) or q_norm.startswith(title):
+            best = min(best, 1)
+        elif q_norm in title or title in q_norm:
+            best = min(best, 2)
+    return best
+
+
+def rank_search_results(results, q):
+    return sorted(
+        results,
+        key=lambda m: (search_match_score(m, q), (m.get("Title") or "").lower()),
+    )
+
+
+def merge_search_results(primary, secondary):
+    by_imdb = {m["imdbID"]: m for m in primary if m.get("imdbID")}
+    by_tmdb = {str(m.get("tmdbID")): m for m in primary if m.get("tmdbID")}
+    merged = list(primary)
+    for movie in secondary:
+        imdb_id = movie.get("imdbID")
+        tmdb_id = str(movie.get("tmdbID") or "")
+        if imdb_id and imdb_id in by_imdb:
+            if movie.get("imdbRating") and not by_imdb[imdb_id].get("imdbRating"):
+                by_imdb[imdb_id]["imdbRating"] = movie["imdbRating"]
+            continue
+        if tmdb_id and tmdb_id in by_tmdb:
+            continue
+        merged.append(movie)
+        if imdb_id:
+            by_imdb[imdb_id] = movie
+        if tmdb_id:
+            by_tmdb[tmdb_id] = movie
+    return merged
+
+
 def normalize_tmdb_item(item):
     movie = normalize_movie(item)
     movie["tmdbID"] = item.get("id")
+    movie["originalTitle"] = item.get("original_title")
     if item.get("imdb_id"):
         movie["imdbID"] = item["imdb_id"]
     elif not movie.get("imdbID"):
@@ -263,8 +377,50 @@ def normalize_tmdb_item(item):
 
 
 def tmdb_search(q, lang="de-DE"):
-    data = tmdb_fetch("/search/movie", {"query": q}, lang=lang)
-    return [normalize_tmdb_item(m) for m in data.get("results", []) if m.get("title")]
+    seen_tmdb = set()
+    results = []
+    for term in search_query_variants(q):
+        data = tmdb_fetch(
+            "/search/movie",
+            {"query": term, "include_adult": "true", "page": 1},
+            lang=lang,
+        )
+        for item in data.get("results", []):
+            if not item.get("title"):
+                continue
+            tmdb_id = item.get("id")
+            if tmdb_id in seen_tmdb:
+                continue
+            seen_tmdb.add(tmdb_id)
+            results.append(normalize_tmdb_item(item))
+    return results
+
+
+def omdb_search(q):
+    data = omdb_fetch({"s": q, "type": "movie"})
+    return [normalize_movie(m) for m in data.get("Search", [])]
+
+
+def movie_search(q, lang="de-DE"):
+    results = []
+    if TMDB_TOKEN:
+        results = tmdb_search(q, lang=lang)
+    if OMDB_KEY:
+        omdb_results = []
+        for term in search_query_variants(q):
+            try:
+                omdb_results = omdb_search(term)
+                if omdb_results:
+                    break
+            except ValueError:
+                continue
+        if omdb_results:
+            results = merge_search_results(results, omdb_results) if results else omdb_results
+    if not results:
+        if not TMDB_TOKEN and not OMDB_KEY:
+            raise ValueError("Kein API-Schlüssel konfiguriert")
+        return []
+    return rank_search_results(results, q)
 
 
 def tmdb_list(endpoint, lang="de-DE"):
@@ -274,18 +430,6 @@ def tmdb_list(endpoint, lang="de-DE"):
         if item.get("title"):
             results.append(normalize_tmdb_item(item))
     return results
-
-
-def movie_search(q, lang="de-DE"):
-    if OMDB_KEY:
-        try:
-            data = omdb_fetch({"s": q, "type": "movie"})
-            return [normalize_movie(m) for m in data.get("Search", [])]
-        except ValueError:
-            pass
-    if TMDB_TOKEN:
-        return tmdb_search(q, lang=lang)
-    raise ValueError("Kein API-Schlüssel konfiguriert")
 
 
 def enrich_movie(movie, lang="de-DE"):
@@ -418,11 +562,13 @@ class Handler(SimpleHTTPRequestHandler):
             })
 
         if path == "/api/settings":
-            s = db["settings"].copy()
+            s = normalize_settings(db["settings"].copy())
             s["omdbApiKeySet"] = bool(s.get("omdbApiKey") or OMDB_KEY)
             s["tmdbApiTokenSet"] = bool(s.get("tmdbApiToken") or TMDB_TOKEN)
             s["omdbApiKey"] = "***" if s.get("omdbApiKey") else ""
             s["tmdbApiToken"] = "***" if s.get("tmdbApiToken") else ""
+            s["streamUrl"] = s.get("streamUrl") or ""
+            s["streamLabel"] = s.get("streamLabel") or "Stream"
             return json_response(self, 200, s)
 
         if path == "/api/users":
@@ -437,6 +583,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return json_response(self, 200, {"results": results, "total": len(results)})
             except ValueError as e:
                 return json_response(self, 503, {"error": str(e)})
+            except Exception as e:
+                return json_response(self, 500, {"error": f"Suche fehlgeschlagen: {e}"})
 
         if len(parts) >= 4 and parts[0] == "api" and parts[1] == "movie" and parts[3] == "details":
             try:
@@ -461,6 +609,22 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path == "/api/watched":
             return json_response(self, 200, lists["watched"])
+
+        if path.startswith("/api/backup/download/"):
+            filename = path.rsplit("/", 1)[-1]
+            if not filename.startswith("backup-") or not filename.endswith(".json") or ".." in filename:
+                return json_response(self, 400, {"error": "Ungültige Datei"})
+            file_path = BACKUP_DIR / filename
+            if not file_path.is_file():
+                return json_response(self, 404, {"error": "Backup nicht gefunden"})
+            data = file_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
 
         if path == "/api/backup":
             try:
@@ -505,6 +669,9 @@ class Handler(SimpleHTTPRequestHandler):
             return json_response(self, 200, db["users"])
 
         if path == "/api/watchlist":
+            blocked = list_write_forbidden(self, db, user_id)
+            if blocked:
+                return blocked
             movie = enrich_movie(body, lang=lang)
             if not movie.get("imdbID"):
                 return json_response(self, 400, {"error": "Film-Daten fehlen"})
@@ -514,6 +681,9 @@ class Handler(SimpleHTTPRequestHandler):
             return json_response(self, 200, lists["watchlist"])
 
         if path == "/api/watched":
+            blocked = list_write_forbidden(self, db, user_id)
+            if blocked:
+                return blocked
             movie = enrich_movie(body.get("movie", body), lang=lang)
             rating = max(1, min(5, int(body.get("rating", 1))))
             if not movie.get("imdbID"):
@@ -530,6 +700,9 @@ class Handler(SimpleHTTPRequestHandler):
             return json_response(self, 200, lists["watched"])
 
         if path == "/api/share":
+            blocked = list_write_forbidden(self, db, user_id)
+            if blocked:
+                return blocked
             share_type = "watched" if body.get("type") == "watched" else "watchlist"
             share_id = str(uuid.uuid4())[:8]
             items = lists[share_type]
@@ -563,11 +736,19 @@ class Handler(SimpleHTTPRequestHandler):
                 s["omdbApiKey"] = extract_api_key(body["omdbApiKey"])
             if body.get("tmdbApiToken") and body["tmdbApiToken"] != "***":
                 s["tmdbApiToken"] = body["tmdbApiToken"].strip()
+            if "streamUrl" in body:
+                s["streamUrl"] = (body["streamUrl"] or "").strip()
+            if "streamLabel" in body:
+                s["streamLabel"] = (body["streamLabel"] or "Stream").strip()
+            db["settings"] = normalize_settings(s)
             write_db(db)
-            apply_api_keys(s)
+            apply_api_keys(db["settings"])
             return json_response(self, 200, {"ok": True})
 
         if "/rating" in path:
+            blocked = list_write_forbidden(self, db, user_id)
+            if blocked:
+                return blocked
             imdb_id = path.split("/")[3]
             rating = max(1, min(5, int(body.get("rating", 1))))
             for m in lists["watched"]:
@@ -587,6 +768,8 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path.startswith("/api/users/"):
             uid = path.split("/")[-1]
+            if user_is_read_only(db, uid):
+                return json_response(self, 400, {"error": "Default-Profil kann nicht gelöscht werden"})
             if len(db["users"]) <= 1:
                 return json_response(self, 400, {"error": "Letzter Benutzer kann nicht gelöscht werden"})
             db["users"] = [u for u in db["users"] if u["id"] != uid]
@@ -595,12 +778,18 @@ class Handler(SimpleHTTPRequestHandler):
             return json_response(self, 200, db["users"])
 
         if path.startswith("/api/watchlist/"):
+            blocked = list_write_forbidden(self, db, user_id)
+            if blocked:
+                return blocked
             imdb_id = path.split("/")[-1]
             lists["watchlist"] = [m for m in lists["watchlist"] if m["imdbID"] != imdb_id]
             write_db(db)
             return json_response(self, 200, lists["watchlist"])
 
         if path.startswith("/api/watched/"):
+            blocked = list_write_forbidden(self, db, user_id)
+            if blocked:
+                return blocked
             imdb_id = path.split("/")[-1]
             lists["watched"] = [m for m in lists["watched"] if m["imdbID"] != imdb_id]
             write_db(db)
