@@ -142,4 +142,4 @@ docker compose down -v         # Stoppen + Volume löschen (alle Daten weg!)
 
 ## Lizenz
 
-Privates Projekt — [Pizza-Dude](https://github.com/Pizza-Dude).
+MIT — siehe [LICENSE](LICENSE). © [Pizza-Dude](https://github.com/Pizza-Dude).
